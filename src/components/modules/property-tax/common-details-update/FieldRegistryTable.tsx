@@ -1,0 +1,321 @@
+"use client";
+/* eslint-disable @typescript-eslint/no-explicit-any, react-hooks/exhaustive-deps */
+import { useMemo, useTransition } from "react";
+import { useRouter } from "next/navigation";
+import {
+  MasterTable,
+  Column,
+  Select,
+  SearchInput,
+  ToggleSwitch,
+  EditButton,
+  Tooltip,
+  Badge,
+  Label
+} from "@/components/common";
+import { BulkUpdateMaster } from "@/types/common-details-update/common-details-update.types";
+import { toast } from "sonner";
+
+import { useFieldRegistryState } from "@/hooks/commonDetailsUpdate/useFieldRegistryState";
+
+interface FieldRegistryTableProps {
+  t: (key: string, values?: any) => string;
+  state: ReturnType<typeof useFieldRegistryState>;
+}
+
+export const FieldRegistryTable = ({ t, state }: FieldRegistryTableProps) => {
+  const router = useRouter();
+  const [, startTransition] = useTransition();
+  const {
+    fields, setFields, refreshFieldsList,
+
+    statusFilter, setStatusFilter,
+    searchTerm, setSearchTerm,
+    pageNumber, setPageNumber,
+    pageSize, setPageSize,
+    submitting,
+    handleEdit,
+    totalCount
+  } = state;
+
+
+
+  const statusOptions = useMemo(() => [
+    { label: t("fieldRegistry.filters.all"), value: "all" },
+    { label: t("fieldRegistry.filters.active"), value: "active" },
+    { label: t("fieldRegistry.filters.inactive"), value: "inactive" }
+  ], [t]);
+
+  const isSameRow = (item: BulkUpdateMaster, target: BulkUpdateMaster) => {
+    if (target.updateCode && item.updateCode === target.updateCode) return true;
+    if (target.masterId != null && item.masterId != null && item.masterId === target.masterId) return true;
+    if (target.id != null && item.id != null && item.id === target.id) return true;
+    return false;
+  };
+
+  const handleToggleStatus = async (row: BulkUpdateMaster, checked: boolean) => {
+    const code = row.updateCode;
+    if (!code) return;
+
+    setFields((prev) =>
+      prev.map((f: BulkUpdateMaster) =>
+        isSameRow(f, row)
+          ? { ...f, isActive: checked }
+          : f
+      )
+    );
+
+    const toggleStatusFn = state.setFieldRegistryStatusAction;
+    if (!toggleStatusFn) {
+      toast.error(t("messages.statusUpdateNotAvailable"));
+      // Revert state
+      setFields((prev) =>
+        prev.map((f: BulkUpdateMaster) =>
+          isSameRow(f, row)
+            ? { ...f, isActive: !checked }
+            : f
+        )
+      );
+      return;
+    }
+
+    const res = await toggleStatusFn(code, checked);
+
+    if (res.success) {
+      toast.success(t(checked ? "messages.statusSetActive" : "messages.statusSetInactive", { name: row.updateName }));
+      if (refreshFieldsList) {
+        await refreshFieldsList();
+      }
+      startTransition(() => {
+        router.refresh();
+      });
+    } else {
+      setFields((prev) =>
+        prev.map((f: BulkUpdateMaster) =>
+          isSameRow(f, row)
+            ? { ...f, isActive: !checked }
+            : f
+        )
+      );
+      toast.error(res.error || t("messages.updateFailed"));
+    }
+  };
+
+  const filteredFields = useMemo(() => {
+    return fields.filter((f: BulkUpdateMaster) => {
+      const fieldNamesStr = f.fieldConfigs
+        ? f.fieldConfigs.map((fc) => fc.fieldName).join(" ")
+        : (f as unknown as Record<string, unknown>).fieldName as string || "";
+
+      const matchesSearch = !searchTerm.trim() ||
+        f.updateName.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        f.updateCode.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        fieldNamesStr.toLowerCase().includes(searchTerm.toLowerCase());
+
+      const matchesStatus = statusFilter === "all" ||
+        (statusFilter === "active" && f.isActive) ||
+        (statusFilter === "inactive" && !f.isActive);
+
+      return matchesSearch && matchesStatus;
+    });
+  }, [fields, searchTerm, statusFilter]);
+
+   
+  const tableColumns = useMemo<Column<any>[]>(() => [
+    {
+      key: "updateName",
+      label: t("fieldRegistry.table.updateName"),
+      render: (_, row) => (
+        <span className="text-sm font-semibold text-slate-800 py-1 block">{row.updateName}</span>
+      )
+    },
+    {
+      key: "fieldName",
+      label: t("fieldRegistry.table.fieldName"),
+      render: (_, row) => {
+        const configs = row.fieldConfigs;
+        const allFieldNames: string[] =
+          configs && Array.isArray(configs) && configs.length > 0
+            ? configs.map((fc: { fieldName: string }) => fc.fieldName).filter(Boolean)
+            : row.fieldName
+              ? String(row.fieldName).split(",").map((s) => s.trim()).filter(Boolean)
+              : [];
+
+        if (allFieldNames.length === 0) {
+          return <span className="text-sm text-slate-400 py-1 block">-</span>;
+        }
+
+        const visibleFields = allFieldNames.slice(0, 2);
+        const remainingCount = allFieldNames.length - 2;
+
+        const tooltipContent = (
+          <div className="flex flex-wrap gap-1 max-w-xs p-1">
+            {allFieldNames.map((name, idx) => (
+              <Badge
+                key={idx}
+                variant="default"
+                size="sm"
+              >
+                {name}
+              </Badge>
+            ))}
+          </div>
+        );
+
+        return (
+          <div className="flex flex-wrap items-center gap-1.5 py-1">
+            {visibleFields.map((name, idx) => (
+              <Badge
+                key={idx}
+                variant="default"
+                size="sm"
+              >
+                {name}
+              </Badge>
+            ))}
+            {remainingCount > 0 && (
+              <Tooltip content={tooltipContent} placement="top">
+                <Badge
+                  variant="outline"
+                  size="sm"
+                  className="bg-indigo-50 text-indigo-700 border border-indigo-200 cursor-pointer hover:bg-indigo-100 transition-colors"
+                >
+                  +{remainingCount}
+                </Badge>
+              </Tooltip>
+            )}
+          </div>
+        );
+      }
+    },
+    {
+      key: "actions",
+      label: t("fieldRegistry.table.action"),
+      align: "center",
+      width: "140px",
+      render: (_, row) => (
+        <div className="flex items-center justify-center gap-3">
+          {handleEdit && (
+            <EditButton
+              size="xs"
+              onClick={() => handleEdit(row)}
+            />
+          )}
+          <ToggleSwitch
+            checked={row.isActive}
+            onChange={(checked) => handleToggleStatus(row, checked)}
+            showPopup={false}
+          />
+        </div>
+      )
+    }
+  ], [handleEdit, setFields, t]);
+
+  const displayTotalCount = (fields.length < totalCount) ? totalCount : filteredFields.length;
+  const totalPages = Math.ceil(displayTotalCount / pageSize);
+
+  const pagedData = useMemo(() => {
+    if (fields.length < totalCount) {
+      return filteredFields.map((f: BulkUpdateMaster) => f as unknown as Record<string, unknown>);
+    }
+    const start = (pageNumber - 1) * pageSize;
+    return filteredFields.slice(start, start + pageSize).map((f: BulkUpdateMaster) => f as unknown as Record<string, unknown>);
+  }, [filteredFields, fields.length, totalCount, pageNumber, pageSize]);
+
+  const totalEligible = displayTotalCount;
+  const activeFieldsCount = fields.filter((f) => f.isActive).length;
+  const generalUserAllowedCount = fields.filter((f) => f.apiRoute && !f.apiRoute.includes("Approval") && f.isActive).length;
+  const approvalRequiredCount = fields.filter((f) => f.apiRoute && f.apiRoute.includes("Approval") && f.isActive).length;
+
+  return (
+    <div className="space-y-2">
+      {/* Filter Section */}
+      <div className="bg-white p-3 rounded-xl border border-slate-200">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          {/* Filters left */}
+          <div className="flex flex-wrap items-center gap-3 w-full lg:w-auto">
+
+            <div className="w-full sm:w-36">
+              <Label className="block text-xs font-semibold text-[#1E3A8A] mb-1">{t("fieldRegistry.filters.status")}</Label>
+              <Select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} options={statusOptions} className="w-full" />
+            </div>
+          </div>
+
+          {/* Centered Stats Cards */}
+          <div className="flex flex-wrap items-center justify-center gap-2 flex-1 w-full mt-2 lg:mt-5">
+            {/* Total Eligible Fields Card */}
+            <div className="flex items-center h-9 border border-blue-200 bg-[#F5F8FF] rounded-lg overflow-hidden text-xs shadow-sm hover:shadow transition-shadow">
+              <span className="font-bold text-[#1E3A8A] px-2.5 py-1.5 bg-[#EEF2FF] h-full flex items-center whitespace-nowrap">
+                {t("fieldRegistry.stats.totalEligible")}
+              </span>
+              <div className="w-px h-full bg-blue-200" />
+              <span className="font-bold text-slate-800 px-3 py-1.5 h-full flex items-center min-w-[2.5rem] justify-center">
+                {totalEligible}
+              </span>
+            </div>
+
+            {/* Active Fields Card */}
+            <div className="flex items-center h-9 border border-green-200 bg-[#F4FBF7] rounded-lg overflow-hidden text-xs shadow-sm hover:shadow transition-shadow">
+              <span className="font-bold text-green-700 px-2.5 py-1.5 bg-[#EAF8F1] h-full flex items-center whitespace-nowrap">
+                {t("fieldRegistry.stats.activeFields")}
+              </span>
+              <div className="w-px h-full bg-green-200" />
+              <span className="font-bold text-slate-800 px-3 py-1.5 h-full flex items-center min-w-[2.5rem] justify-center">
+                {activeFieldsCount}
+              </span>
+            </div>
+
+            {/* General User Allowed Card */}
+            <div className="flex items-center h-9 border border-amber-200 bg-[#FDF9F2] rounded-lg overflow-hidden text-xs shadow-sm hover:shadow transition-shadow">
+              <span className="font-bold text-amber-700 px-2.5 py-1.5 bg-[#FAF1E3] h-full flex items-center whitespace-nowrap">
+                {t("fieldRegistry.stats.generalUserAllowed")}
+              </span>
+              <div className="w-px h-full bg-amber-200" />
+              <span className="font-bold text-slate-800 px-3 py-1.5 h-full flex items-center min-w-[2.5rem] justify-center">
+                {generalUserAllowedCount}
+              </span>
+            </div>
+
+            {/* Approval Required Card */}
+            <div className="flex items-center h-9 border border-purple-200 bg-[#FAF5FF] rounded-lg overflow-hidden text-xs shadow-sm hover:shadow transition-shadow">
+              <span className="font-bold text-purple-700 px-2.5 py-1.5 bg-[#F3E8FF] h-full flex items-center whitespace-nowrap">
+                {t("fieldRegistry.stats.approvalRequired")}
+              </span>
+              <div className="w-px h-full bg-purple-200" />
+              <span className="font-bold text-slate-800 px-3 py-1.5 h-full flex items-center min-w-[2.5rem] justify-center">
+                {approvalRequiredCount}
+              </span>
+            </div>
+          </div>
+
+          {/* Search right */}
+          <div className="w-full lg:w-64 self-end">
+            <SearchInput value={searchTerm} onChange={setSearchTerm} placeholder={t("fieldRegistry.filters.searchPlaceholder")} className="w-full" />
+          </div>
+        </div>
+      </div>
+
+      {/* MasterTable with pagination */}
+      <MasterTable
+        columns={tableColumns}
+        data={pagedData}
+        pageNumber={pageNumber}
+        pageSize={pageSize}
+        totalCount={displayTotalCount}
+        totalPages={totalPages}
+        onPageChange={setPageNumber}
+        onPageSizeChange={(size) => {
+          setPageSize(size);
+          setPageNumber(1);
+        }}
+        paginationConfig={{
+          enabled: true,
+          showPageSizeSelector: true
+        }}
+        emptyText={t("fieldRegistry.emptyState.title")}
+        loading={submitting}
+        maxBodyHeightClassName="max-h-[350px]"
+      />
+    </div>
+  );
+};
