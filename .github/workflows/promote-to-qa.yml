@@ -1,4 +1,11 @@
-name: Promote Approved PR to QA
+name: Promote Approved PR to QA - TEST
+
+env:
+  # TEMPORARY TEST SETTINGS
+  # Change these to your actual test branches.
+  PR_BASE_BRANCH: test-main
+  QA_TARGET_BRANCH: qa-test
+  TEMP_BYPASS_CI: "true"
 
 on:
   pull_request_review:
@@ -10,6 +17,13 @@ on:
       - CI Build and Test
     types:
       - completed
+
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to test manually"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -23,7 +37,7 @@ concurrency:
 jobs:
   promote:
     name: Promote PR to QA
-    runs-on: [self-hosted, ci]
+    runs-on: windows-latest
 
     steps:
       - name: Determine PR number
@@ -45,6 +59,10 @@ jobs:
             }
 
             $prNumber = "${{ github.event.workflow_run.pull_requests[0].number }}"
+          }
+
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $prNumber = "${{ inputs.pr_number }}"
           }
 
           if ([string]::IsNullOrWhiteSpace($prNumber)) {
@@ -80,8 +98,8 @@ jobs:
             exit 0
           }
 
-          if ($pr.base.ref -ne "main") {
-            Write-Host "PR does not target main."
+          if ($pr.base.ref -ne "$env:PR_BASE_BRANCH") {
+            Write-Host "PR does not target configured base branch: $env:PR_BASE_BRANCH"
             "eligible=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             exit 0
           }
@@ -97,7 +115,7 @@ jobs:
           "branch=$($pr.head.ref)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "sha=$($pr.head.sha)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Check build-and-test status
+      - name: Check CI or temporarily bypass
         if: steps.prinfo.outputs.eligible == 'true'
         id: ci
         env:
@@ -105,6 +123,12 @@ jobs:
           HEAD_SHA: ${{ steps.prinfo.outputs.sha }}
         shell: pwsh
         run: |
+          if ($env:TEMP_BYPASS_CI -eq "true") {
+            Write-Warning "TEMPORARY TEST MODE: build-and-test is BYPASSED."
+            "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            exit 0
+          }
+
           $response = gh api `
             -H "Accept: application/vnd.github+json" `
             "repos/${{ github.repository }}/commits/$env:HEAD_SHA/check-runs" |
@@ -210,7 +234,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          ref: qa
+          ref: ${{ env.QA_TARGET_BRANCH }}
           token: ${{ github.token }}
 
       - name: Configure Git
@@ -234,10 +258,10 @@ jobs:
           HEAD_SHA: ${{ steps.prinfo.outputs.sha }}
         shell: pwsh
         run: |
-          git fetch origin qa
+          git fetch origin "$env:QA_TARGET_BRANCH"
           git fetch origin "$env:FEATURE_BRANCH"
 
-          git merge-base --is-ancestor "$env:HEAD_SHA" "origin/qa"
+          git merge-base --is-ancestor "$env:HEAD_SHA" "origin/$env:QA_TARGET_BRANCH"
 
           if ($LASTEXITCODE -eq 0) {
             Write-Host "Current PR commit is already contained in QA."
@@ -268,13 +292,13 @@ jobs:
           Write-Host "PR head SHA    : $env:HEAD_SHA"
 
           git fetch origin
-          git checkout qa
-          git reset --hard origin/qa
+          git checkout "$env:QA_TARGET_BRANCH"
+          git reset --hard "origin/$env:QA_TARGET_BRANCH"
 
           # Merge exactly the commit that passed CI and was approved.
           git merge "$env:HEAD_SHA" `
             --no-ff `
-            -m "Promote PR #$env:PR_NUMBER to QA"
+            -m "Promote PR #$env:PR_NUMBER to $env:QA_TARGET_BRANCH"
 
           if ($LASTEXITCODE -ne 0) {
             Write-Error "Merge conflict or merge failure while promoting PR #$env:PR_NUMBER to QA."
@@ -282,7 +306,7 @@ jobs:
             exit 1
           }
 
-          git push origin HEAD:qa
+          git push origin "HEAD:$env:QA_TARGET_BRANCH"
 
       - name: Comment on original PR
         if: >
@@ -301,4 +325,4 @@ jobs:
 
           gh pr comment $env:PR_NUMBER `
             --repo "${{ github.repository }}" `
-            --body "✅ CI passed and 2 Lead approvals were received. Commit ``$shortSha`` has been promoted to the ``qa`` branch. The original PR remains open against ``main`` for QA testing and final approval."
+            --body "✅ TEST promotion completed. CI bypass: ``$env:TEMP_BYPASS_CI``. Commit ``$shortSha`` was promoted to ``$env:QA_TARGET_BRANCH``. The original PR remains open against ``$env:PR_BASE_BRANCH``."
