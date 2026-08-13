@@ -1,0 +1,304 @@
+name: Promote Approved PR to QA
+
+on:
+  pull_request_review:
+    types:
+      - submitted
+
+  workflow_run:
+    workflows:
+      - CI Build and Test
+    types:
+      - completed
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+concurrency:
+  group: promote-to-qa
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote PR to QA
+    runs-on: [self-hosted, ci]
+
+    steps:
+      - name: Determine PR number
+        id: pr
+        shell: pwsh
+        run: |
+          $prNumber = ""
+
+          if ("${{ github.event_name }}" -eq "pull_request_review") {
+            $prNumber = "${{ github.event.pull_request.number }}"
+          }
+
+          if ("${{ github.event_name }}" -eq "workflow_run") {
+            # Only process CI runs that came from a pull request.
+            if ("${{ github.event.workflow_run.event }}" -ne "pull_request") {
+              Write-Host "CI run did not originate from a pull request. Nothing to promote."
+              "found=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+              exit 0
+            }
+
+            $prNumber = "${{ github.event.workflow_run.pull_requests[0].number }}"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($prNumber)) {
+            Write-Host "No pull request found for this event."
+            "found=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            exit 0
+          }
+
+          Write-Host "PR Number: $prNumber"
+          "found=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "number=$prNumber" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Read PR information
+        if: steps.pr.outputs.found == 'true'
+        id: prinfo
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        shell: pwsh
+        run: |
+          $pr = gh api "repos/${{ github.repository }}/pulls/$env:PR_NUMBER" |
+            ConvertFrom-Json
+
+          Write-Host "PR #$env:PR_NUMBER"
+          Write-Host "State : $($pr.state)"
+          Write-Host "Base  : $($pr.base.ref)"
+          Write-Host "Head  : $($pr.head.ref)"
+          Write-Host "SHA   : $($pr.head.sha)"
+
+          if ($pr.state -ne "open") {
+            Write-Host "PR is no longer open."
+            "eligible=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            exit 0
+          }
+
+          if ($pr.base.ref -ne "main") {
+            Write-Host "PR does not target main."
+            "eligible=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            exit 0
+          }
+
+          # This workflow supports branches from the same repository.
+          if ($pr.head.repo.full_name -ne "${{ github.repository }}") {
+            Write-Host "PR comes from a fork. Automatic QA promotion is disabled."
+            "eligible=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            exit 0
+          }
+
+          "eligible=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "branch=$($pr.head.ref)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha=$($pr.head.sha)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Check build-and-test status
+        if: steps.prinfo.outputs.eligible == 'true'
+        id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.prinfo.outputs.sha }}
+        shell: pwsh
+        run: |
+          $response = gh api `
+            -H "Accept: application/vnd.github+json" `
+            "repos/${{ github.repository }}/commits/$env:HEAD_SHA/check-runs" |
+            ConvertFrom-Json
+
+          $check = $response.check_runs |
+            Where-Object { $_.name -eq "build-and-test" } |
+            Sort-Object completed_at -Descending |
+            Select-Object -First 1
+
+          if ($null -eq $check) {
+            Write-Host "Required check 'build-and-test' was not found."
+            "ready=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            exit 0
+          }
+
+          Write-Host "build-and-test status     : $($check.status)"
+          Write-Host "build-and-test conclusion : $($check.conclusion)"
+
+          if ($check.status -eq "completed" -and $check.conclusion -eq "success") {
+            "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+          else {
+            "ready=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Check two Lead approvals
+        if: steps.prinfo.outputs.eligible == 'true'
+        id: approvals
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          LEAD_APPROVERS: ${{ vars.LEAD_APPROVERS }}
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:LEAD_APPROVERS)) {
+            Write-Error "Repository variable LEAD_APPROVERS is not configured."
+            exit 1
+          }
+
+          $allowedLeads = @(
+            $env:LEAD_APPROVERS -split "," |
+            ForEach-Object { $_.Trim().ToLower() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+          )
+
+          Write-Host "Configured Leads:"
+          $allowedLeads | ForEach-Object { Write-Host " - $_" }
+
+          $reviews = gh api `
+            --paginate `
+            "repos/${{ github.repository }}/pulls/$env:PR_NUMBER/reviews" |
+            ConvertFrom-Json
+
+          # Keep the latest review state for every configured Lead.
+          $latestByLead = @{}
+
+          foreach ($review in ($reviews | Sort-Object submitted_at)) {
+            $login = $review.user.login.ToLower()
+
+            if ($allowedLeads -contains $login) {
+              $latestByLead[$login] = $review.state
+            }
+          }
+
+          $approvedLeads = @(
+            $latestByLead.GetEnumerator() |
+            Where-Object { $_.Value -eq "APPROVED" } |
+            ForEach-Object { $_.Key }
+          )
+
+          Write-Host "Approved Leads:"
+          $approvedLeads | ForEach-Object { Write-Host " - $_" }
+
+          Write-Host "Approved Lead count: $($approvedLeads.Count)"
+
+          if ($approvedLeads.Count -ge 2) {
+            "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+          else {
+            "ready=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Show gate result
+        if: steps.prinfo.outputs.eligible == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "CI passed          : ${{ steps.ci.outputs.ready }}"
+          Write-Host "2 Lead approvals   : ${{ steps.approvals.outputs.ready }}"
+
+          if (
+            "${{ steps.ci.outputs.ready }}" -ne "true" -or
+            "${{ steps.approvals.outputs.ready }}" -ne "true"
+          ) {
+            Write-Host "PR is not ready for QA promotion."
+          }
+
+      - name: Checkout QA
+        if: >
+          steps.prinfo.outputs.eligible == 'true' &&
+          steps.ci.outputs.ready == 'true' &&
+          steps.approvals.outputs.ready == 'true'
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: qa
+          token: ${{ github.token }}
+
+      - name: Configure Git
+        if: >
+          steps.prinfo.outputs.eligible == 'true' &&
+          steps.ci.outputs.ready == 'true' &&
+          steps.approvals.outputs.ready == 'true'
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Check whether this PR version is already in QA
+        if: >
+          steps.prinfo.outputs.eligible == 'true' &&
+          steps.ci.outputs.ready == 'true' &&
+          steps.approvals.outputs.ready == 'true'
+        id: already
+        env:
+          FEATURE_BRANCH: ${{ steps.prinfo.outputs.branch }}
+          HEAD_SHA: ${{ steps.prinfo.outputs.sha }}
+        shell: pwsh
+        run: |
+          git fetch origin qa
+          git fetch origin "$env:FEATURE_BRANCH"
+
+          git merge-base --is-ancestor "$env:HEAD_SHA" "origin/qa"
+
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Current PR commit is already contained in QA."
+            "value=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+          else {
+            Write-Host "Current PR commit has not yet been promoted to QA."
+            "value=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+          # merge-base returns 1 when it is not an ancestor; that is expected.
+          exit 0
+
+      - name: Promote feature branch to QA
+        if: >
+          steps.prinfo.outputs.eligible == 'true' &&
+          steps.ci.outputs.ready == 'true' &&
+          steps.approvals.outputs.ready == 'true' &&
+          steps.already.outputs.value != 'true'
+        env:
+          FEATURE_BRANCH: ${{ steps.prinfo.outputs.branch }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.prinfo.outputs.sha }}
+        shell: pwsh
+        run: |
+          Write-Host "Promoting PR #$env:PR_NUMBER to QA"
+          Write-Host "Feature branch : $env:FEATURE_BRANCH"
+          Write-Host "PR head SHA    : $env:HEAD_SHA"
+
+          git fetch origin
+          git checkout qa
+          git reset --hard origin/qa
+
+          # Merge exactly the commit that passed CI and was approved.
+          git merge "$env:HEAD_SHA" `
+            --no-ff `
+            -m "Promote PR #$env:PR_NUMBER to QA"
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Merge conflict or merge failure while promoting PR #$env:PR_NUMBER to QA."
+            git merge --abort 2>$null
+            exit 1
+          }
+
+          git push origin HEAD:qa
+
+      - name: Comment on original PR
+        if: >
+          steps.prinfo.outputs.eligible == 'true' &&
+          steps.ci.outputs.ready == 'true' &&
+          steps.approvals.outputs.ready == 'true' &&
+          steps.already.outputs.value != 'true' &&
+          success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.prinfo.outputs.sha }}
+        shell: pwsh
+        run: |
+          $shortSha = $env:HEAD_SHA.Substring(0, 7)
+
+          gh pr comment $env:PR_NUMBER `
+            --repo "${{ github.repository }}" `
+            --body "✅ CI passed and 2 Lead approvals were received. Commit ``$shortSha`` has been promoted to the ``qa`` branch. The original PR remains open against ``main`` for QA testing and final approval."
