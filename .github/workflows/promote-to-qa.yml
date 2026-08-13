@@ -37,7 +37,7 @@ concurrency:
 jobs:
   promote:
     name: Promote PR to QA
-    runs-on: [self-hosted, ci]
+    runs-on: windows-latest
 
     steps:
       - name: Determine PR number
