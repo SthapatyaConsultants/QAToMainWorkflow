@@ -1,11 +1,9 @@
 name: Promote Approved PR to QA - TEST
 
 env:
-  # TEMPORARY TEST SETTINGS
-  # Change these to your actual test branches.
-  PR_BASE_BRANCH: test-main
-  QA_TARGET_BRANCH: qa-test
-  TEMP_BYPASS_CI: "true"
+  PR_BASE_BRANCH: main
+  QA_TARGET_BRANCH: qa
+  TEMP_BYPASS_CI: "false"
 
 on:
   pull_request_review:
