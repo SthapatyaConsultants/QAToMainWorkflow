@@ -89,6 +89,7 @@ jobs:
           Write-Host "SHA   : $($pr.head.sha)"
 
           if ($pr.state -ne "open") {
+            Write-Host "PR is not open."
             "eligible=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             exit 0
           }
@@ -123,7 +124,10 @@ jobs:
             exit 0
           }
 
-          $response = gh api -H "Accept: application/vnd.github+json" "repos/${{ github.repository }}/commits/$env:HEAD_SHA/check-runs" | ConvertFrom-Json
+          $response = gh api `
+            -H "Accept: application/vnd.github+json" `
+            "repos/${{ github.repository }}/commits/$env:HEAD_SHA/check-runs" |
+            ConvertFrom-Json
 
           $check = $response.check_runs |
             Where-Object { $_.name -eq "build-and-test" } |
@@ -131,9 +135,13 @@ jobs:
             Select-Object -First 1
 
           if ($null -eq $check) {
+            Write-Host "Required check 'build-and-test' was not found."
             "ready=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             exit 0
           }
+
+          Write-Host "build-and-test status     : $($check.status)"
+          Write-Host "build-and-test conclusion : $($check.conclusion)"
 
           if ($check.status -eq "completed" -and $check.conclusion -eq "success") {
             "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
@@ -162,7 +170,14 @@ jobs:
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
           )
 
-          $reviews = gh api --paginate "repos/${{ github.repository }}/pulls/$env:PR_NUMBER/reviews" | ConvertFrom-Json
+          Write-Host "Configured Leads:"
+          $allowedLeads | ForEach-Object { Write-Host " - $_" }
+
+          $reviews = gh api `
+            --paginate `
+            "repos/${{ github.repository }}/pulls/$env:PR_NUMBER/reviews" |
+            ConvertFrom-Json
+
           $latestByLead = @{}
 
           foreach ($review in ($reviews | Sort-Object submitted_at)) {
@@ -178,6 +193,8 @@ jobs:
             ForEach-Object { $_.Key }
           )
 
+          Write-Host "Approved Leads:"
+          $approvedLeads | ForEach-Object { Write-Host " - $_" }
           Write-Host "Approved Lead count: $($approvedLeads.Count)"
 
           if ($approvedLeads.Count -ge 2) {
@@ -205,7 +222,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ env.QA_TARGET_BRANCH }}
-          token: ${{ github.token }}
+          token: ${{ secrets.QA_PROMOTION_TOKEN }}
 
       - name: Configure Git
         if: >
@@ -214,8 +231,8 @@ jobs:
           steps.approvals.outputs.ready == 'true'
         shell: pwsh
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "qa-promotion-bot"
+          git config user.email "qa-promotion-bot@users.noreply.github.com"
 
       - name: Check whether PR version is already in QA
         if: >
@@ -228,12 +245,18 @@ jobs:
         shell: pwsh
         run: |
           git fetch origin "$env:QA_TARGET_BRANCH"
-          git merge-base --is-ancestor "$env:HEAD_SHA" "origin/$env:QA_TARGET_BRANCH"
+
+          git merge-base `
+            --is-ancestor `
+            "$env:HEAD_SHA" `
+            "origin/$env:QA_TARGET_BRANCH"
 
           if ($LASTEXITCODE -eq 0) {
+            Write-Host "Current PR commit is already contained in $env:QA_TARGET_BRANCH."
             "value=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
           else {
+            Write-Host "Current PR commit has not yet been promoted."
             "value=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
 
@@ -260,7 +283,10 @@ jobs:
           git checkout "$env:QA_TARGET_BRANCH"
           git reset --hard "origin/$env:QA_TARGET_BRANCH"
 
-          git merge "$env:HEAD_SHA" --no-ff -m "Promote PR #$env:PR_NUMBER to $env:QA_TARGET_BRANCH"
+          git merge `
+            "$env:HEAD_SHA" `
+            --no-ff `
+            -m "Promote PR #$env:PR_NUMBER to $env:QA_TARGET_BRANCH"
 
           if ($LASTEXITCODE -ne 0) {
             git merge --abort 2>$null
@@ -285,6 +311,7 @@ jobs:
         run: |
           $shortSha = $env:HEAD_SHA.Substring(0, 7)
 
-          gh pr comment $env:PR_NUMBER `
+          gh pr comment `
+            $env:PR_NUMBER `
             --repo "${{ github.repository }}" `
             --body "✅ CI passed and 2 Lead approvals were received. Commit ``$shortSha`` has been promoted to ``$env:QA_TARGET_BRANCH``. The original PR remains open against ``$env:PR_BASE_BRANCH`` for QA testing and final approval."
