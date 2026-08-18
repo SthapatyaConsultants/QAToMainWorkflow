@@ -222,7 +222,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ env.QA_TARGET_BRANCH }}
-          token: ${{ secrets.PAT_TOKEN }}
+          token: ${{ secrets.QA_PROMOTION_TOKEN }}
 
       - name: Configure Git
         if: >
