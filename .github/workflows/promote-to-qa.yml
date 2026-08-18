@@ -1,11 +1,9 @@
-name: Promote Approved PR to QA - TEST
+name: Promote Approved PR to QA
 
 env:
-  # TEMPORARY TEST SETTINGS
-  # Change these to your actual test branches.
-  PR_BASE_BRANCH: test-main
-  QA_TARGET_BRANCH: qa-test
-  TEMP_BYPASS_CI: "true"
+  PR_BASE_BRANCH: main
+  QA_TARGET_BRANCH: qa
+  TEMP_BYPASS_CI: "false"
 
 on:
   pull_request_review:
@@ -21,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: "PR number to test manually"
+        description: "PR number to promote manually"
         required: true
         type: string
 
@@ -51,9 +49,8 @@ jobs:
           }
 
           if ("${{ github.event_name }}" -eq "workflow_run") {
-            # Only process CI runs that came from a pull request.
             if ("${{ github.event.workflow_run.event }}" -ne "pull_request") {
-              Write-Host "CI run did not originate from a pull request. Nothing to promote."
+              Write-Host "CI run did not originate from a pull request."
               "found=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
               exit 0
             }
@@ -83,8 +80,7 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
         shell: pwsh
         run: |
-          $pr = gh api "repos/${{ github.repository }}/pulls/$env:PR_NUMBER" |
-            ConvertFrom-Json
+          $pr = gh api "repos/${{ github.repository }}/pulls/$env:PR_NUMBER" | ConvertFrom-Json
 
           Write-Host "PR #$env:PR_NUMBER"
           Write-Host "State : $($pr.state)"
@@ -93,18 +89,17 @@ jobs:
           Write-Host "SHA   : $($pr.head.sha)"
 
           if ($pr.state -ne "open") {
-            Write-Host "PR is no longer open."
+            Write-Host "PR is not open."
             "eligible=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             exit 0
           }
 
           if ($pr.base.ref -ne "$env:PR_BASE_BRANCH") {
-            Write-Host "PR does not target configured base branch: $env:PR_BASE_BRANCH"
+            Write-Host "PR target '$($pr.base.ref)' does not match '$env:PR_BASE_BRANCH'."
             "eligible=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             exit 0
           }
 
-          # This workflow supports branches from the same repository.
           if ($pr.head.repo.full_name -ne "${{ github.repository }}") {
             Write-Host "PR comes from a fork. Automatic QA promotion is disabled."
             "eligible=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
@@ -115,7 +110,7 @@ jobs:
           "branch=$($pr.head.ref)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "sha=$($pr.head.sha)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Check CI or temporarily bypass
+      - name: Check build-and-test
         if: steps.prinfo.outputs.eligible == 'true'
         id: ci
         env:
@@ -124,7 +119,7 @@ jobs:
         shell: pwsh
         run: |
           if ($env:TEMP_BYPASS_CI -eq "true") {
-            Write-Warning "TEMPORARY TEST MODE: build-and-test is BYPASSED."
+            Write-Warning "TEMPORARY MODE: build-and-test is bypassed."
             "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             exit 0
           }
@@ -183,12 +178,10 @@ jobs:
             "repos/${{ github.repository }}/pulls/$env:PR_NUMBER/reviews" |
             ConvertFrom-Json
 
-          # Keep the latest review state for every configured Lead.
           $latestByLead = @{}
 
           foreach ($review in ($reviews | Sort-Object submitted_at)) {
             $login = $review.user.login.ToLower()
-
             if ($allowedLeads -contains $login) {
               $latestByLead[$login] = $review.state
             }
@@ -202,7 +195,6 @@ jobs:
 
           Write-Host "Approved Leads:"
           $approvedLeads | ForEach-Object { Write-Host " - $_" }
-
           Write-Host "Approved Lead count: $($approvedLeads.Count)"
 
           if ($approvedLeads.Count -ge 2) {
@@ -216,15 +208,10 @@ jobs:
         if: steps.prinfo.outputs.eligible == 'true'
         shell: pwsh
         run: |
-          Write-Host "CI passed          : ${{ steps.ci.outputs.ready }}"
-          Write-Host "2 Lead approvals   : ${{ steps.approvals.outputs.ready }}"
-
-          if (
-            "${{ steps.ci.outputs.ready }}" -ne "true" -or
-            "${{ steps.approvals.outputs.ready }}" -ne "true"
-          ) {
-            Write-Host "PR is not ready for QA promotion."
-          }
+          Write-Host "PR Base Branch   : $env:PR_BASE_BRANCH"
+          Write-Host "QA Target Branch : $env:QA_TARGET_BRANCH"
+          Write-Host "CI Ready         : ${{ steps.ci.outputs.ready }}"
+          Write-Host "2 Lead Approvals : ${{ steps.approvals.outputs.ready }}"
 
       - name: Checkout QA
         if: >
@@ -235,7 +222,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ env.QA_TARGET_BRANCH }}
-          token: ${{ github.token }}
+          token: ${{ secrets.QA_PROMOTION_TOKEN }}
 
       - name: Configure Git
         if: >
@@ -244,35 +231,35 @@ jobs:
           steps.approvals.outputs.ready == 'true'
         shell: pwsh
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "qa-promotion-bot"
+          git config user.email "qa-promotion-bot@users.noreply.github.com"
 
-      - name: Check whether this PR version is already in QA
+      - name: Check whether PR version is already in QA
         if: >
           steps.prinfo.outputs.eligible == 'true' &&
           steps.ci.outputs.ready == 'true' &&
           steps.approvals.outputs.ready == 'true'
         id: already
         env:
-          FEATURE_BRANCH: ${{ steps.prinfo.outputs.branch }}
           HEAD_SHA: ${{ steps.prinfo.outputs.sha }}
         shell: pwsh
         run: |
           git fetch origin "$env:QA_TARGET_BRANCH"
-          git fetch origin "$env:FEATURE_BRANCH"
 
-          git merge-base --is-ancestor "$env:HEAD_SHA" "origin/$env:QA_TARGET_BRANCH"
+          git merge-base `
+            --is-ancestor `
+            "$env:HEAD_SHA" `
+            "origin/$env:QA_TARGET_BRANCH"
 
           if ($LASTEXITCODE -eq 0) {
-            Write-Host "Current PR commit is already contained in QA."
+            Write-Host "Current PR commit is already contained in $env:QA_TARGET_BRANCH."
             "value=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
           else {
-            Write-Host "Current PR commit has not yet been promoted to QA."
+            Write-Host "Current PR commit has not yet been promoted."
             "value=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
 
-          # merge-base returns 1 when it is not an ancestor; that is expected.
           exit 0
 
       - name: Promote feature branch to QA
@@ -283,26 +270,27 @@ jobs:
           steps.already.outputs.value != 'true'
         env:
           FEATURE_BRANCH: ${{ steps.prinfo.outputs.branch }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
           HEAD_SHA: ${{ steps.prinfo.outputs.sha }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
         shell: pwsh
         run: |
-          Write-Host "Promoting PR #$env:PR_NUMBER to QA"
+          Write-Host "Promoting PR #$env:PR_NUMBER"
           Write-Host "Feature branch : $env:FEATURE_BRANCH"
           Write-Host "PR head SHA    : $env:HEAD_SHA"
+          Write-Host "Target branch  : $env:QA_TARGET_BRANCH"
 
           git fetch origin
           git checkout "$env:QA_TARGET_BRANCH"
           git reset --hard "origin/$env:QA_TARGET_BRANCH"
 
-          # Merge exactly the commit that passed CI and was approved.
-          git merge "$env:HEAD_SHA" `
+          git merge `
+            "$env:HEAD_SHA" `
             --no-ff `
             -m "Promote PR #$env:PR_NUMBER to $env:QA_TARGET_BRANCH"
 
           if ($LASTEXITCODE -ne 0) {
-            Write-Error "Merge conflict or merge failure while promoting PR #$env:PR_NUMBER to QA."
             git merge --abort 2>$null
+            Write-Error "Merge conflict or merge failure while promoting PR #$env:PR_NUMBER."
             exit 1
           }
 
@@ -323,6 +311,7 @@ jobs:
         run: |
           $shortSha = $env:HEAD_SHA.Substring(0, 7)
 
-          gh pr comment $env:PR_NUMBER `
+          gh pr comment `
+            $env:PR_NUMBER `
             --repo "${{ github.repository }}" `
-            --body "✅ TEST promotion completed. CI bypass: ``$env:TEMP_BYPASS_CI``. Commit ``$shortSha`` was promoted to ``$env:QA_TARGET_BRANCH``. The original PR remains open against ``$env:PR_BASE_BRANCH``."
+            --body "✅ CI passed and 2 Lead approvals were received. Commit ``$shortSha`` has been promoted to ``$env:QA_TARGET_BRANCH``. The original PR remains open against ``$env:PR_BASE_BRANCH`` for QA testing and final approval."
